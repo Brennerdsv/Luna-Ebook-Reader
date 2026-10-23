@@ -20,9 +20,13 @@ import com.luna.reader.document.Chapter
 import com.luna.reader.document.DocumentChunker
 import com.luna.reader.document.TextChunk
 import com.luna.reader.service.LunaPlaybackService
+import com.luna.reader.tts.AudioSynthesisRouter
 import com.luna.reader.tts.AvailableVoice
 import com.luna.reader.tts.LocalTtsManager
+import com.luna.reader.tts.NoInternetException
 import com.luna.reader.tts.TtsSynthesisResult
+import com.luna.reader.tts.VoiceEngine
+import com.luna.reader.tts.VoiceNotDownloadedException
 import com.luna.reader.tts.WordBoundary
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -58,18 +62,20 @@ data class PlaybackUiState(
     val currentPositionMs: Long = 0,
     val durationMs: Long = 0,
     val currentVoice: AvailableVoice = AvailableVoice.DEFAULT,
-    val speed: Float = 1.0f
+    val speed: Float = 1.0f,
+    val errorMessage: String? = null,
+    val fallbackVoicePrompt: AvailableVoice? = null
 )
 
 /**
- * Orquestrador de leitura contínua com suporte a execução contínua em segundo plano
- * e com tela bloqueada via enfileiramento na playlist nativa do ExoPlayer (AndroidX Media3).
+ * Orquestrador de leitura contínua com suporte a motor híbrido
+ * (Faber Sherpa-ONNX 100% offline e vozes neurais Microsoft Edge-TTS online).
  *
- * Utiliza o modelo neural offline local Lucas Razo (Sherpa-ONNX / Piper TTS) para geração
- * instantânea de áudio PCM diretamente no processador do dispositivo.
+ * Suporta execução em segundo plano com tela bloqueada via playlist nativa do ExoPlayer.
  */
 class AudioPrefetchManager(
     appContext: Context,
+    private val audioSynthesisRouter: AudioSynthesisRouter = AudioSynthesisRouter.getInstance(appContext.applicationContext),
     private val localTtsManager: LocalTtsManager = LocalTtsManager.getInstance(appContext.applicationContext),
     private val preferencesRepository: UserPreferencesRepository = UserPreferencesRepository(appContext.applicationContext)
 ) {
@@ -345,7 +351,7 @@ class AudioPrefetchManager(
         // Cancelamento de requisições anteriores
         ttsJob?.cancel()
         prefetchJob?.cancel()
-        localTtsManager.cancelCurrentRequest()
+        audioSynthesisRouter.cancelCurrentRequest()
 
         val chunk = currentState.chunks[chunkIndex]
         val chapterIdx = chunk.chapterIndex
@@ -354,7 +360,9 @@ class AudioPrefetchManager(
             currentChunkIndex = chunkIndex,
             currentChapterIndex = chapterIdx,
             isLoading = true,
-            activeWord = null
+            activeWord = null,
+            errorMessage = null,
+            fallbackVoicePrompt = null
         )
         persistReadingPosition()
 
@@ -387,8 +395,15 @@ class AudioPrefetchManager(
                 enqueueNextChunks(chunkIndex + 1)
             } catch (t: Throwable) {
                 if (isActive) {
-                    Log.e(TAG, "AudioPrefetchManager: FALHA CRÍTICA ao sintetizar/reproduzir chunk $chunkIndex: ${t.message}", t)
-                    _uiState.value = _uiState.value.copy(isLoading = false, isPlaying = false)
+                    Log.e(TAG, "AudioPrefetchManager: FALHA ao sintetizar/reproduzir chunk $chunkIndex: ${t.message}", t)
+                    val isOfflineError = t is NoInternetException
+                    val fallback = if (isOfflineError) AvailableVoice.FABER else null
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        isPlaying = false,
+                        errorMessage = t.message ?: "Erro na síntese de áudio",
+                        fallbackVoicePrompt = fallback
+                    )
                 }
             }
         }
@@ -499,11 +514,11 @@ class AudioPrefetchManager(
             ?: throw IllegalArgumentException("Chunk não encontrado no índice $index")
 
         val state = _uiState.value
-        val result = localTtsManager.synthesizeChunk(
+        val result = audioSynthesisRouter.synthesize(
             text = chunk.text,
+            voice = state.currentVoice,
             speed = state.speed,
-            chunkIndex = index,
-            voice = state.currentVoice
+            chunkIndex = index
         )
         synthesisCache[index] = result
         return result
@@ -566,7 +581,7 @@ class AudioPrefetchManager(
             preferencesRepository.setPlaybackSpeed(speed)
             ttsJob?.cancel()
             prefetchJob?.cancel()
-            localTtsManager.cancelCurrentRequest()
+            audioSynthesisRouter.cancelCurrentRequest()
             mediaController?.stop()
             mediaController?.clearMediaItems()
             synthesisCache.clear()
@@ -590,7 +605,7 @@ class AudioPrefetchManager(
                 // 2. Cancela jobs de síntese e prefetch ativos
                 ttsJob?.cancel()
                 prefetchJob?.cancel()
-                localTtsManager.cancelCurrentRequest()
+                audioSynthesisRouter.cancelCurrentRequest()
 
                 // 3. Limpa o cache de blocos de áudio da voz antiga
                 synthesisCache.clear()
@@ -599,15 +614,19 @@ class AudioPrefetchManager(
                 _uiState.value = _uiState.value.copy(
                     currentVoice = voice,
                     isLoading = true,
-                    activeWord = null
+                    activeWord = null,
+                    errorMessage = null,
+                    fallbackVoicePrompt = null
                 )
 
                 // 5. Salva no DataStore (selected_offline_voice)
                 preferencesRepository.setSelectedVoice(voice)
 
-                // 6. Alterna o motor em segundo plano (libera RAM da anterior e carrega a nova)
-                withContext(Dispatchers.IO) {
-                    localTtsManager.switchVoice(voice)
+                // 6. Se for offline, alterna o modelo em segundo plano
+                if (voice.engine is VoiceEngine.OfflinePiper) {
+                    withContext(Dispatchers.IO) {
+                        localTtsManager.switchVoice(voice)
+                    }
                 }
 
                 // 7. Retoma reprodução com a nova voz
@@ -616,9 +635,22 @@ class AudioPrefetchManager(
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "Erro ao trocar para voz ${voice.displayName}: ${t.message}", t)
-                _uiState.value = _uiState.value.copy(isLoading = false)
+                val isOfflineError = t is NoInternetException
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    errorMessage = t.message ?: "Erro ao alternar de narrador",
+                    fallbackVoicePrompt = if (isOfflineError) AvailableVoice.FABER else null
+                )
             }
         }
+    }
+
+    fun clearError() {
+        _uiState.value = _uiState.value.copy(errorMessage = null, fallbackVoicePrompt = null)
+    }
+
+    fun switchToOfflineFallback() {
+        setVoice(AvailableVoice.FABER)
     }
 
     /**
@@ -656,7 +688,7 @@ class AudioPrefetchManager(
             ttsJob?.cancel()
             prefetchJob?.cancel()
             stopProgressTracking()
-            localTtsManager.cancelCurrentRequest()
+            audioSynthesisRouter.cancelCurrentRequest()
             mediaController?.stop()
             mediaController?.clearMediaItems()
             synthesisCache.clear()
@@ -720,8 +752,8 @@ class AudioPrefetchManager(
         progressTrackingJob?.cancel()
         prefetchJob?.cancel()
         ttsJob?.cancel()
-        localTtsManager.cancelCurrentRequest()
-        localTtsManager.release()
+        audioSynthesisRouter.cancelCurrentRequest()
+        audioSynthesisRouter.release()
         mediaController?.release()
         controllerFuture = null
     }

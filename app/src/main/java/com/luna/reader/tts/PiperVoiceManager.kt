@@ -14,19 +14,13 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
- * Gerenciador de arquivos dos modelos neurais de voz offline (Piper TTS / VITS / Sherpa-ONNX).
- *
- * Responsável por:
- * 1. Verificar integridade e disponibilidade local de cada narrador (Lucas Razo, Faber, etc.).
- * 2. Copiar modelos empacotados em `assets/voice/` de forma atômica (via `.tmp`).
- * 3. Baixar modelos sob demanda do Hugging Face com relatório de progresso.
- * 4. Extrair e converter o mapeamento de fonemas (`phoneme_id_map`) em tokens.txt.
+ * Gerenciador de armazenamento, validação e download sob demanda do narrador offline
+ * Faber (Piper TTS / VITS / Sherpa-ONNX).
  */
 object PiperVoiceManager {
 
     private const val TAG = "LunaTTS"
     private const val ESPEAK_DIR_NAME = "espeak-ng-data"
-    private const val VOICE_V2_MARKER = ".voice_v2_metadata_ready"
 
     data class ModelPaths(
         val modelPath: String,
@@ -41,8 +35,23 @@ object PiperVoiceManager {
             .build()
     }
 
-    fun getVoiceDirectory(context: Context): File {
-        val dir = File(context.filesDir, "voice")
+    /**
+     * Retorna o diretório exclusivo de uma voz offline (ex: context.filesDir/voices/faber).
+     */
+    fun getVoiceDirectory(context: Context, voice: AvailableVoice = AvailableVoice.FABER): File {
+        val folderName = when (voice) {
+            AvailableVoice.FABER -> "faber"
+            else -> voice.id
+        }
+        val dir = File(context.filesDir, "voices/$folderName")
+        if (!dir.exists()) {
+            dir.mkdirs()
+        }
+        return dir
+    }
+
+    fun getSharedEspeakDirectory(context: Context): File {
+        val dir = File(context.filesDir, "voice/$ESPEAK_DIR_NAME")
         if (!dir.exists()) {
             dir.mkdirs()
         }
@@ -50,32 +59,17 @@ object PiperVoiceManager {
     }
 
     /**
-     * Retorna o arquivo de tokens correspondente para a voz informada.
-     */
-    fun getTokensFile(voiceDir: File, voice: AvailableVoice): File {
-        val voiceSpecific = File(voiceDir, voice.tokensFileName)
-        if (voiceSpecific.exists() && voiceSpecific.length() > 50L) {
-            return voiceSpecific
-        }
-        // Fallback para tokens.txt genérico (compatibilidade com Lucas Razo)
-        if (voice == AvailableVoice.LUCAS_RAZO) {
-            val genericTokens = File(voiceDir, "tokens.txt")
-            if (genericTokens.exists() && genericTokens.length() > 50L) {
-                return genericTokens
-            }
-        }
-        return voiceSpecific
-    }
-
-    /**
-     * Validação rigorosa se a voz está pronta para execução offline imediata no disco.
+     * Validação se o modelo offline está 100% baixado e pronto para execução no disco.
      */
     fun isVoiceReady(context: Context, voice: AvailableVoice): Boolean {
-        val voiceDir = getVoiceDirectory(context)
-        val modelFile = File(voiceDir, voice.modelFileName)
-        val tokensFile = getTokensFile(voiceDir, voice)
-        val configFile = File(voiceDir, voice.configFileName)
-        val espeakDir = File(voiceDir, ESPEAK_DIR_NAME)
+        if (!voice.isOfflineCapable) return true // Vozes online não precisam de download de modelo
+
+        val offlineEngine = voice.engine as? VoiceEngine.OfflinePiper ?: return false
+        val voiceDir = getVoiceDirectory(context, voice)
+        val modelFile = File(voiceDir, offlineEngine.modelFileName)
+        val tokensFile = File(voiceDir, voice.tokensFileName)
+        val configFile = File(voiceDir, offlineEngine.configFileName)
+        val espeakDir = getSharedEspeakDirectory(context)
         val phondata = File(espeakDir, "phondata")
         val phontab = File(espeakDir, "phontab")
 
@@ -88,90 +82,69 @@ object PiperVoiceManager {
     }
 
     /**
-     * Prepara e valida os arquivos necessários para inicializar a voz no Sherpa-ONNX.
-     * Copia de assets caso existam; caso contrário, executa download sob demanda.
+     * Prepara os caminhos dos arquivos necessários para inicializar o Sherpa-ONNX.
      */
     suspend fun prepareVoice(
         context: Context,
         voice: AvailableVoice,
         onProgress: ((message: String, progress: Float) -> Unit)? = null
     ): ModelPaths = withContext(Dispatchers.IO) {
-        val voiceDir = getVoiceDirectory(context)
-        val modelFile = File(voiceDir, voice.modelFileName)
-        val configFile = File(voiceDir, voice.configFileName)
-        val tokensFile = getTokensFile(voiceDir, voice)
-        val espeakDir = File(voiceDir, ESPEAK_DIR_NAME)
+        val offlineEngine = voice.engine as? VoiceEngine.OfflinePiper
+            ?: throw IllegalArgumentException("A voz ${voice.displayName} não utiliza o motor offline Piper")
 
-        Log.d(TAG, "PiperVoiceManager: preparando voz '${voice.displayName}' em ${voiceDir.absolutePath}...")
+        val voiceDir = getVoiceDirectory(context, voice)
+        val espeakDir = getSharedEspeakDirectory(context)
+        val modelFile = File(voiceDir, offlineEngine.modelFileName)
+        val configFile = File(voiceDir, offlineEngine.configFileName)
+        val tokensFile = File(voiceDir, voice.tokensFileName)
 
-        // Se Lucas Razo, garante limpeza da v1 sem metadados
-        if (voice == AvailableVoice.LUCAS_RAZO) {
-            val versionMarker = File(voiceDir, VOICE_V2_MARKER)
-            if (!versionMarker.exists()) {
-                Log.i(TAG, "PiperVoiceManager: migração v2 detectada para Lucas Razo...")
-                try {
-                    if (modelFile.exists()) modelFile.delete()
-                    if (configFile.exists()) configFile.delete()
-                    if (tokensFile.exists()) tokensFile.delete()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Aviso na limpeza: ${e.message}")
-                }
-            }
-        }
+        Log.d(TAG, "PiperVoiceManager: preparando voz offline '${voice.displayName}' em ${voiceDir.absolutePath}...")
 
-        // Se o modelo existir mas tiver tamanho corrompido (< 30 MB), deleta
+        // 1. Garante que espeak-ng-data esteja presente (copia de assets)
+        copyEspeakDataSafely(context.assets, espeakDir)
+
+        // 2. Se o modelo estiver corrompido no disco (< 30 MB), deleta
         if (modelFile.exists() && modelFile.length() < 30_000_000L) {
-            Log.w(TAG, "PiperVoiceManager: modelo corrompido detectado (${modelFile.length()} bytes). Deletando...")
+            Log.w(TAG, "PiperVoiceManager: arquivo corrompido detectado (${modelFile.length()} bytes). Removendo...")
             modelFile.delete()
         }
 
-        // 1. Tenta copiar arquivos correspondentes de assets/voice/
-        copyVoiceAssetsSafely(context, voice, voiceDir, espeakDir)
+        // 3. Tenta copiar de assets/ caso venha pré-instalado
+        copyIndividualAsset(context.assets, "voice/${offlineEngine.modelFileName}", modelFile, minSize = 30_000_000L)
+        copyIndividualAsset(context.assets, "voice/${offlineEngine.configFileName}", configFile, minSize = 100L)
+        copyIndividualAsset(context.assets, "voice/${voice.tokensFileName}", tokensFile, minSize = 50L)
 
-        if (voice == AvailableVoice.LUCAS_RAZO && modelFile.exists() && modelFile.length() > 30_000_000L) {
-            try { File(voiceDir, VOICE_V2_MARKER).createNewFile() } catch (_: Exception) {}
-        }
-
-        // 2. Garante geração de tokens a partir do config JSON se necessário
-        if ((!tokensFile.exists() || tokensFile.length() < 50L) && configFile.exists() && configFile.length() > 0L) {
-            Log.d(TAG, "PiperVoiceManager: gerando tokens para ${voice.id}...")
-            generateTokensFromConfigJson(configFile, tokensFile)
-        }
-
-        // 3. Fallback: Download sob demanda se o modelo ainda não existir
+        // 4. Download sob demanda se o modelo não existir
         if (!modelFile.exists() || modelFile.length() < 30_000_000L) {
-            onProgress?.invoke("Baixando voz neural ${voice.displayName}...", 0.1f)
-            Log.i(TAG, "PiperVoiceManager: baixando ${voice.modelFileName} de ${voice.downloadUrlModel}...")
-            downloadFile(voice.downloadUrlModel, modelFile) { progress ->
+            onProgress?.invoke("Baixando modelo offline ${voice.displayName}...", 0.1f)
+            Log.i(TAG, "PiperVoiceManager: baixando ${offlineEngine.modelFileName}...")
+            downloadFile(offlineEngine.modelUrl, modelFile) { progress ->
                 onProgress?.invoke("Baixando voz ${voice.displayName} (${(progress * 100).toInt()}%)...", progress * 0.85f)
             }
         }
 
+        // 5. Configuração e geração de tokens
         if (!tokensFile.exists() || tokensFile.length() < 50L) {
             if (!configFile.exists() || configFile.length() == 0L) {
-                onProgress?.invoke("Baixando configurações da voz...", 0.9f)
-                Log.i(TAG, "PiperVoiceManager: baixando config para ${voice.id}...")
-                downloadFile(voice.downloadUrlConfig, configFile)
+                onProgress?.invoke("Baixando configurações fonéticas...", 0.9f)
+                downloadFile(offlineEngine.configUrl, configFile)
             }
             generateTokensFromConfigJson(configFile, tokensFile)
         }
 
-        // 4. Validação final estrita
+        // Validação final estrita
         val phondata = File(espeakDir, "phondata")
         if (!modelFile.exists() || modelFile.length() < 10_000_000L) {
             throw IllegalStateException("Arquivo do modelo inválido ou incompleto: ${modelFile.absolutePath}")
         }
         if (!tokensFile.exists() || tokensFile.length() == 0L) {
-            throw IllegalStateException("Arquivo de tokens ausente ou vazio: ${tokensFile.absolutePath}")
+            throw IllegalStateException("Arquivo de tokens ausente: ${tokensFile.absolutePath}")
         }
         if (!espeakDir.exists() || !phondata.exists() || phondata.length() == 0L) {
-            throw IllegalStateException("Diretório espeak-ng-data corrompido em: ${espeakDir.absolutePath}")
+            throw IllegalStateException("Diretório espeak-ng-data ausente em: ${espeakDir.absolutePath}")
         }
 
-        Log.i(TAG, "PiperVoiceManager: Voz '${voice.displayName}' pronta e validada com sucesso!")
-        Log.d(TAG, "  -> Model: ${modelFile.absolutePath} (${modelFile.length() / (1024 * 1024)} MB)")
-        Log.d(TAG, "  -> Tokens: ${tokensFile.absolutePath} (${tokensFile.length()} bytes)")
-        Log.d(TAG, "  -> EspeakData: ${espeakDir.absolutePath}")
+        Log.i(TAG, "PiperVoiceManager: Voz offline '${voice.displayName}' pronta!")
 
         ModelPaths(
             modelPath = modelFile.absolutePath,
@@ -181,32 +154,30 @@ object PiperVoiceManager {
     }
 
     /**
-     * Download autônomo com progresso percentual (0.0 a 1.0) para uso direto no BottomSheet.
+     * Download autônomo com progresso percentual (0.0 a 1.0) para uso direto na interface.
      */
     suspend fun downloadVoice(
         context: Context,
         voice: AvailableVoice,
         onProgress: ((Float) -> Unit)? = null
     ): Boolean = withContext(Dispatchers.IO) {
-        val voiceDir = getVoiceDirectory(context)
-        val modelFile = File(voiceDir, voice.modelFileName)
-        val configFile = File(voiceDir, voice.configFileName)
-        val tokensFile = getTokensFile(voiceDir, voice)
-        val espeakDir = File(voiceDir, ESPEAK_DIR_NAME)
+        val offlineEngine = voice.engine as? VoiceEngine.OfflinePiper ?: return@withContext false
+        val voiceDir = getVoiceDirectory(context, voice)
+        val espeakDir = getSharedEspeakDirectory(context)
+        val modelFile = File(voiceDir, offlineEngine.modelFileName)
+        val configFile = File(voiceDir, offlineEngine.configFileName)
+        val tokensFile = File(voiceDir, voice.tokensFileName)
 
         try {
-            // Garante que espeak-ng-data esteja presente
             copyEspeakDataSafely(context.assets, espeakDir)
 
-            // Download do config.json primeiro (rápido, ~7KB)
             if (!configFile.exists() || configFile.length() == 0L) {
-                downloadFile(voice.downloadUrlConfig, configFile)
+                downloadFile(offlineEngine.configUrl, configFile)
             }
             generateTokensFromConfigJson(configFile, tokensFile)
 
-            // Download do modelo .onnx (~63MB)
             if (!modelFile.exists() || modelFile.length() < 30_000_000L) {
-                downloadFile(voice.downloadUrlModel, modelFile) { progress ->
+                downloadFile(offlineEngine.modelUrl, modelFile) { progress ->
                     onProgress?.invoke(progress)
                 }
             }
@@ -214,26 +185,32 @@ object PiperVoiceManager {
             onProgress?.invoke(1.0f)
             isVoiceReady(context, voice)
         } catch (t: Throwable) {
-            Log.e(TAG, "Falha ao baixar voz ${voice.displayName}: ${t.message}", t)
+            Log.e(TAG, "Falha ao baixar voz offline ${voice.displayName}: ${t.message}", t)
             false
         }
     }
 
-    private fun copyVoiceAssetsSafely(context: Context, voice: AvailableVoice, voiceDir: File, espeakDir: File) {
-        val assetManager = context.assets
+    /**
+     * Exclui os arquivos da voz offline para liberar espaço em disco (~60 MB).
+     */
+    fun deleteVoice(context: Context, voice: AvailableVoice): Boolean {
+        if (!voice.isOfflineCapable) return false
+        val offlineEngine = voice.engine as? VoiceEngine.OfflinePiper ?: return false
+        val voiceDir = getVoiceDirectory(context, voice)
+        val modelFile = File(voiceDir, offlineEngine.modelFileName)
+        val configFile = File(voiceDir, offlineEngine.configFileName)
+        val tokensFile = File(voiceDir, voice.tokensFileName)
 
-        // Copia arquivos do modelo e config específicos
-        copyIndividualAsset(assetManager, "voice/${voice.modelFileName}", File(voiceDir, voice.modelFileName), minSize = 30_000_000L)
-        copyIndividualAsset(assetManager, "voice/${voice.configFileName}", File(voiceDir, voice.configFileName), minSize = 100L)
-        copyIndividualAsset(assetManager, "voice/${voice.tokensFileName}", File(voiceDir, voice.tokensFileName), minSize = 50L)
-
-        // Se for Lucas Razo, também aceita tokens.txt genérico
-        if (voice == AvailableVoice.LUCAS_RAZO) {
-            copyIndividualAsset(assetManager, "voice/tokens.txt", File(voiceDir, "tokens.txt"), minSize = 50L)
+        var deleted = false
+        try {
+            if (modelFile.exists()) deleted = modelFile.delete() || deleted
+            if (configFile.exists()) configFile.delete()
+            if (tokensFile.exists()) tokensFile.delete()
+            Log.i(TAG, "PiperVoiceManager: modelo offline ${voice.displayName} excluído do disco.")
+        } catch (e: Exception) {
+            Log.w(TAG, "Aviso ao excluir modelo ${voice.displayName}: ${e.message}")
         }
-
-        // Copia diretório espeak-ng-data compartilhado
-        copyEspeakDataSafely(assetManager, espeakDir)
+        return deleted
     }
 
     private fun copyEspeakDataSafely(assetManager: AssetManager, espeakDir: File) {
@@ -269,9 +246,8 @@ object PiperVoiceManager {
             if (destFile.exists()) destFile.delete()
             tmpFile.renameTo(destFile)
             Log.d(TAG, "Asset '$assetPath' copiado com sucesso (${destFile.length()} bytes)")
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             if (tmpFile.exists()) tmpFile.delete()
-            Log.d(TAG, "Asset '$assetPath' não encontrado em assets (será feito download se necessário)")
         }
     }
 

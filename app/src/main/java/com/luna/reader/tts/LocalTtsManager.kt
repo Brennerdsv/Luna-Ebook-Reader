@@ -17,8 +17,7 @@ import java.nio.ByteOrder
 
 /**
  * Gerenciador de Síntese de Voz Neural 100% Offline via Sherpa-ONNX (Piper TTS / VITS).
- * Suporta múltiplos narradores em Português Brasileiro (Lucas Razo, Faber, etc.) com troca a quente
- * e liberação imediata de memória RAM do modelo anterior.
+ * Executa a voz offline Faber diretamente na CPU do dispositivo.
  *
  * Todas as operações de I/O, carregamento de pesos e geração de áudio executam
  * ESTRITAMENTE em Dispatchers.IO com tratamento exaustivo de erros e logs detalhados.
@@ -191,7 +190,7 @@ class LocalTtsManager private constructor(private val appContext: Context) {
             throw RuntimeException("Falha ao inicializar motor neural C++ para ${voice.displayName}: ${t.message}", t)
         }
 
-        val sampleRate = try { engine.sampleRate() } catch (_: Throwable) { voice.sampleRate }
+        val sampleRate = try { engine.sampleRate() } catch (_: Throwable) { 22050 }
         Log.i(TAG, "LocalTtsManager: Narrador '${voice.displayName}' pronto e operacional! (sampleRate=${sampleRate}Hz)")
         return engine
     }
@@ -235,7 +234,7 @@ class LocalTtsManager private constructor(private val appContext: Context) {
         }
 
         val samples = generatedAudio.samples
-        val sampleRate = if (generatedAudio.sampleRate > 0) generatedAudio.sampleRate else voice.sampleRate
+        val sampleRate = if (generatedAudio.sampleRate > 0) generatedAudio.sampleRate else 22050
 
         if (samples.isEmpty()) {
             val err = "Síntese neural retornou 0 amostras de áudio para o texto fornecido"

@@ -119,7 +119,8 @@ class MainActivity : ComponentActivity() {
                                 onSelectChapter = { chapterIndex -> audioManager.playChapter(chapterIndex) },
                                 onPersistProgress = { audioManager.persistReadingPosition() },
                                 onSpeedChange = { speed -> audioManager.setSpeed(speed) },
-                                onVoiceChange = { voice -> audioManager.setVoice(voice) }
+                                onVoiceChange = { voice -> audioManager.setVoice(voice) },
+                                onDismissError = { audioManager.clearError() }
                             )
                         }
                     }

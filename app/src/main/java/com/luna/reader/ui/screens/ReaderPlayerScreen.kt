@@ -37,7 +37,7 @@ import com.luna.reader.playback.PlaybackUiState
 import com.luna.reader.tts.AvailableVoice
 import com.luna.reader.tts.WordBoundary
 import com.luna.reader.ui.components.ChapterListBottomSheet
-import com.luna.reader.ui.components.VoiceSelectionBottomSheet
+import com.luna.reader.ui.components.VoiceManagerBottomSheet
 import com.luna.reader.ui.theme.*
 
 enum class ReaderViewMode {
@@ -56,6 +56,7 @@ fun ReaderPlayerScreen(
     onPersistProgress: () -> Unit,
     onSpeedChange: (Float) -> Unit,
     onVoiceChange: (AvailableVoice) -> Unit = {},
+    onDismissError: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var viewMode by remember { mutableStateOf(ReaderViewMode.READING_FLOW) }
@@ -262,12 +263,50 @@ fun ReaderPlayerScreen(
             }
 
             if (showVoiceBottomSheet) {
-                VoiceSelectionBottomSheet(
+                VoiceManagerBottomSheet(
                     currentVoice = playbackState.currentVoice,
                     onSelectVoice = { voice ->
                         onVoiceChange(voice)
                     },
                     onDismissRequest = { showVoiceBottomSheet = false }
+                )
+            }
+
+            if (playbackState.errorMessage != null) {
+                AlertDialog(
+                    onDismissRequest = onDismissError,
+                    icon = {
+                        Icon(
+                            imageVector = Icons.Default.WifiOff,
+                            contentDescription = null,
+                            tint = LunaTertiary,
+                            modifier = Modifier.size(32.dp)
+                        )
+                    },
+                    title = {
+                        Text("Aviso de Conectividade", fontWeight = FontWeight.Bold)
+                    },
+                    text = {
+                        Text(playbackState.errorMessage ?: "")
+                    },
+                    confirmButton = {
+                        if (playbackState.fallbackVoicePrompt != null) {
+                            Button(
+                                onClick = {
+                                    onDismissError()
+                                    onVoiceChange(playbackState.fallbackVoicePrompt)
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = LunaPrimary)
+                            ) {
+                                Text("Usar Faber (Offline)")
+                            }
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = onDismissError) {
+                            Text("Fechar")
+                        }
+                    }
                 )
             }
 
